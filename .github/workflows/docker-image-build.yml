@@ -12,7 +12,8 @@ on:
         default: 'v0.1.0'
 
 env:
-  ALIYUN_REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  ACR_HOST: crpi-8l7h3z38ikkatd81.cn-shanghai.personal.cr.aliyuncs.com
+  ACR: crpi-8l7h3z38ikkatd81.cn-shanghai.personal.cr.aliyuncs.com/peak-aiot
 
 jobs:
   resolve-version:
@@ -74,17 +75,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Log in to Aliyun Container Registry
         uses: docker/login-action@v4
         with:
-          registry: ${{ env.ALIYUN_REGISTRY }}
+          registry: ${{ env.ACR_HOST }}
           username: ${{ secrets.IMAGE_USER }}
           password: ${{ secrets.IMAGE_PASS }}
 
@@ -99,8 +93,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: true
           tags: |
-            ghcr.io/${{ needs.resolve-version.outputs.owner_lower }}/${{ matrix.image_name }}:${{ needs.resolve-version.outputs.tag }}-${{ matrix.arch }}
-            registry.cn-hangzhou.aliyuncs.com/${{ needs.resolve-version.outputs.owner_lower }}/${{ matrix.image_name }}:${{ needs.resolve-version.outputs.tag }}-${{ matrix.arch }}
+            ${{ env.ACR }}/${{ matrix.image_name }}:${{ needs.resolve-version.outputs.tag }}-${{ matrix.arch }}
           cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.arch }}
           # 阿里云容器镜像仓库当前不识别 Buildx 默认生成的 OCI provenance attestation。
@@ -122,17 +115,10 @@ jobs:
           - thingsvis-server
           - thingsvis-studio
     steps:
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Log in to Aliyun Container Registry
         uses: docker/login-action@v4
         with:
-          registry: ${{ env.ALIYUN_REGISTRY }}
+          registry: ${{ env.ACR_HOST }}
           username: ${{ secrets.IMAGE_USER }}
           password: ${{ secrets.IMAGE_PASS }}
 
@@ -142,17 +128,60 @@ jobs:
       - name: Publish multi-arch manifests
         run: |
           TAG="${{ needs.resolve-version.outputs.tag }}"
-          OWNER="${{ needs.resolve-version.outputs.owner_lower }}"
           IMAGE="${{ matrix.image_name }}"
 
           docker buildx imagetools create \
-            -t "ghcr.io/${OWNER}/${IMAGE}:${TAG}" \
-            -t "ghcr.io/${OWNER}/${IMAGE}:latest" \
-            "ghcr.io/${OWNER}/${IMAGE}:${TAG}-amd64" \
-            "ghcr.io/${OWNER}/${IMAGE}:${TAG}-arm64"
+            -t "${ACR}/${IMAGE}:${TAG}" \
+            -t "${ACR}/${IMAGE}:latest" \
+            "${ACR}/${IMAGE}:${TAG}-amd64" \
+            "${ACR}/${IMAGE}:${TAG}-arm64"
 
-          docker buildx imagetools create \
-            -t "${ALIYUN_REGISTRY}/${OWNER}/${IMAGE}:${TAG}" \
-            -t "${ALIYUN_REGISTRY}/${OWNER}/${IMAGE}:latest" \
-            "${ALIYUN_REGISTRY}/${OWNER}/${IMAGE}:${TAG}-amd64" \
-            "${ALIYUN_REGISTRY}/${OWNER}/${IMAGE}:${TAG}-arm64"
+  deploy:
+    name: Deploy thingsvis to Aliyun server
+    needs:
+      - resolve-version
+      - publish-manifest
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_SSH_KEY"
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "${DEPLOY_PORT:-22}" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+      - name: Login ACR on server
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          ACR_VPC_HOST: crpi-8l7h3z38ikkatd81-vpc.cn-shanghai.personal.cr.aliyuncs.com
+          ACR_USER: ${{ secrets.IMAGE_USER }}
+          ACR_PASS: ${{ secrets.IMAGE_PASS }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ACR_PASS" | ssh -i ~/.ssh/id_deploy -p "${DEPLOY_PORT:-22}" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "docker login '$ACR_VPC_HOST' -u '$ACR_USER' --password-stdin"
+      - name: Update thingsvis services
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          VERSION: ${{ needs.resolve-version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy -p "${DEPLOY_PORT:-22}" "$DEPLOY_USER@$DEPLOY_HOST" "
+            set -e
+            cd /opt/thingspanel
+            sed -i 's#^TP_TAG_THINGSVIS=.*#TP_TAG_THINGSVIS=${VERSION}#' .env
+            docker compose pull thingsvis-server thingsvis-studio
+            docker compose up -d thingsvis-server thingsvis-studio
+            docker compose ps thingsvis-server thingsvis-studio
+          "

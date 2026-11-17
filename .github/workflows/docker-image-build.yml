@@ -1,158 +1,133 @@
+# 工作流名称
 name: Docker Image Build
-
+# 触发方式:
+# - Push触发: 推送到 dev 分支自动构建并推送自有阿里云 ACR（仅 linux/amd64）
+# - Release触发: 创建 Release 时自动构建并推送自有阿里云 ACR（linux/amd64,linux/arm64）
+# - 手动触发: 可以通过 GitHub Actions 页面手动触发
 on:
-  push:
-    tags:
-      - 'v*'
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Version tag (e.g. v0.1.0)'
-        required: true
-        default: 'v0.1.0'
-
+      version:
+        description: "Image tag to build, for example v1.0.23"
+        required: false
+  push:
+    branches:
+      - dev
+# 构建任务
 env:
-  ALIYUN_REGISTRY: registry.cn-hangzhou.aliyuncs.com
-
+  ACR_HOST: crpi-8l7h3z38ikkatd81.cn-shanghai.personal.cr.aliyuncs.com
+  ACR: crpi-8l7h3z38ikkatd81.cn-shanghai.personal.cr.aliyuncs.com/peak-aiot
+  ACR_VPC_HOST: crpi-8l7h3z38ikkatd81-vpc.cn-shanghai.personal.cr.aliyuncs.com
+  DEFAULT_VERSION: v1.0.23
 jobs:
-  resolve-version:
-    name: Resolve Version
+  # 构建 thingsvis-server / thingsvis-studio 两个镜像
+  build:
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.version.outputs.tag }}
-      owner_lower: ${{ steps.version.outputs.owner_lower }}
-    steps:
-      - name: Resolve version tag
-        id: version
-        run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          OWNER_LOWER="${{ github.repository_owner }}"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "owner_lower=${OWNER_LOWER,,}" >> "$GITHUB_OUTPUT"
-          echo "Version: ${TAG}, Owner: ${OWNER_LOWER,,}"
-
-  build-docker:
-    name: Build ${{ matrix.image_name }} (${{ matrix.arch }})
-    needs: resolve-version
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    permissions:
-      contents: read
-      packages: write
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
           - image_name: thingsvis-server
             dockerfile: apps/server/Dockerfile
-            arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-latest
-            build_args: |
-              DATABASE_URL=file:./prisma/dev.db
-          - image_name: thingsvis-server
-            dockerfile: apps/server/Dockerfile
-            arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
             build_args: |
               DATABASE_URL=file:./prisma/dev.db
           - image_name: thingsvis-studio
             dockerfile: apps/studio/Dockerfile
-            arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-latest
             build_args: ""
-          - image_name: thingsvis-studio
-            dockerfile: apps/studio/Dockerfile
-            arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            build_args: ""
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+      # 检出代码
+      - name: 检出代码
+        uses: actions/checkout@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Aliyun Container Registry
-        uses: docker/login-action@v4
+          fetch-depth: 0
+      # 获取版本号
+      - name: 获取版本号
+        id: get_version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "branch" ]; then
+            echo "VERSION=${DEFAULT_VERSION}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          RELEASE_TAG="${{ github.event.release.tag_name }}"
+          INPUT_VERSION="${{ github.event.inputs.version }}"
+          if [ -n "$RELEASE_TAG" ]; then
+            VERSION="$RELEASE_TAG"
+          elif [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "${DEFAULT_VERSION}")
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      # 登录镜像仓库
+      - name: 登录镜像仓库
+        uses: docker/login-action@v3
         with:
-          registry: ${{ env.ALIYUN_REGISTRY }}
+          registry: ${{ env.ACR_HOST }}
           username: ${{ secrets.IMAGE_USER }}
           password: ${{ secrets.IMAGE_PASS }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build and push architecture image
-        uses: docker/build-push-action@v7
+      # 设置 QEMU / Docker Buildx
+      - name: 设置 QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      # 构建并推送到你的阿里云 ACR：分支推送仅 amd64，发布时多架构
+      - name: 构建并推送到 ACR
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          platforms: ${{ matrix.platform }}
+          platforms: ${{ github.event_name == 'push' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           push: true
-          tags: |
-            ghcr.io/${{ needs.resolve-version.outputs.owner_lower }}/${{ matrix.image_name }}:${{ needs.resolve-version.outputs.tag }}-${{ matrix.arch }}
-            registry.cn-hangzhou.aliyuncs.com/${{ needs.resolve-version.outputs.owner_lower }}/${{ matrix.image_name }}:${{ needs.resolve-version.outputs.tag }}-${{ matrix.arch }}
-          cache-from: type=gha,scope=${{ matrix.image_name }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}-${{ matrix.arch }}
-          # 阿里云容器镜像仓库当前不识别 Buildx 默认生成的 OCI provenance attestation。
           provenance: false
           build-args: ${{ matrix.build_args }}
-
-  publish-manifest:
-    name: Publish ${{ matrix.image_name }} manifest
-    needs:
-      - resolve-version
-      - build-docker
+          tags: |
+            ${{ env.ACR }}/${{ matrix.image_name }}:${{ env.VERSION }}
+  # 发布/手动触发时，更新阿里云服务器上的 thingsvis 服务
+  deploy:
+    needs: build
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    permissions:
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        image_name:
-          - thingsvis-server
-          - thingsvis-studio
     steps:
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Aliyun Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.ALIYUN_REGISTRY }}
-          username: ${{ secrets.IMAGE_USER }}
-          password: ${{ secrets.IMAGE_PASS }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Publish multi-arch manifests
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
         run: |
-          TAG="${{ needs.resolve-version.outputs.tag }}"
-          OWNER="${{ needs.resolve-version.outputs.owner_lower }}"
-          IMAGE="${{ matrix.image_name }}"
-
-          docker buildx imagetools create \
-            -t "ghcr.io/${OWNER}/${IMAGE}:${TAG}" \
-            -t "ghcr.io/${OWNER}/${IMAGE}:latest" \
-            "ghcr.io/${OWNER}/${IMAGE}:${TAG}-amd64" \
-            "ghcr.io/${OWNER}/${IMAGE}:${TAG}-arm64"
-
-          docker buildx imagetools create \
-            -t "${ALIYUN_REGISTRY}/${OWNER}/${IMAGE}:${TAG}" \
-            -t "${ALIYUN_REGISTRY}/${OWNER}/${IMAGE}:latest" \
-            "${ALIYUN_REGISTRY}/${OWNER}/${IMAGE}:${TAG}-amd64" \
-            "${ALIYUN_REGISTRY}/${OWNER}/${IMAGE}:${TAG}-arm64"
+          set -euo pipefail
+          test -n "$DEPLOY_SSH_KEY"
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "${DEPLOY_PORT:-22}" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+      - name: Login ACR on server
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          ACR_USER: ${{ secrets.IMAGE_USER }}
+          ACR_PASS: ${{ secrets.IMAGE_PASS }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ACR_PASS" | ssh -i ~/.ssh/id_deploy -p "${DEPLOY_PORT:-22}" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "docker login '${ACR_VPC_HOST}' -u '${ACR_USER}' --password-stdin"
+      - name: Update thingsvis services
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          VERSION: ${{ github.event.release.tag_name || github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy -p "${DEPLOY_PORT:-22}" "$DEPLOY_USER@$DEPLOY_HOST" "
+            set -e
+            cd /opt/thingspanel
+            sed -i 's#^TP_TAG_THINGSVIS=.*#TP_TAG_THINGSVIS=${VERSION}#' .env
+            docker compose pull thingsvis-server thingsvis-studio
+            docker compose up -d thingsvis-server thingsvis-studio
+            docker compose ps thingsvis-server thingsvis-studio
+          "

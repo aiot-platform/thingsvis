@@ -16,7 +16,7 @@ permissions:
 env:
   ACR_HOST: crpi-8l7h3z38ikkatd81.cn-shanghai.personal.cr.aliyuncs.com
   ACR: crpi-8l7h3z38ikkatd81.cn-shanghai.personal.cr.aliyuncs.com/peak-aiot
-  VERSION: v1.0.23
+  VERSION: 1.2-release
 
 jobs:
   build:
